@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "wrapperVersion": "0.5.1",
+  "remill": {
+    "version": "6.0.1",
+    "commit": "0e324aee8c67a63ec759ef379dcfafa0b3cb1448"
+  },
+  "sleigh": {
+    "commit": "7c6b7424467d0382a1303c278633e99b0d094d5b"
+  },
+  "llvm": {
+    "version": "18.1.8",
+    "abiBreakingChecks": 0
+  },
+  "windowsRuntime": "MT",
+  "supportedSemantics": [
+    "x86",
+    "x86_avx",
+    "x86_avx512",
+    "amd64",
+    "amd64_avx",
+    "amd64_avx512",
+    "aarch64",
+    "sparc32"
+  ]
+}

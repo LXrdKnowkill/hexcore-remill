@@ -385,6 +385,22 @@ static std::filesystem::path GetSemanticsDir() {
 // RemillLifter
 // ---------------------------------------------------------------------------
 
+static constexpr const char* kPackagedArchs[] = {
+	"x86", "x86_avx", "x86_avx512",
+	"amd64", "amd64_avx", "amd64_avx512",
+	"aarch64",
+	"sparc32",
+};
+
+static bool IsPackagedArch(const std::string& archName) {
+	for (const char* packagedArch : kPackagedArchs) {
+		if (archName == packagedArch) {
+			return true;
+		}
+	}
+	return false;
+}
+
 Napi::Object RemillLifter::Init(Napi::Env env, Napi::Object exports) {
 	Napi::Function func = DefineClass(env, "RemillLifter", {
 		InstanceMethod("liftBytes", &RemillLifter::LiftBytes),
@@ -418,6 +434,17 @@ RemillLifter::RemillLifter(const Napi::CallbackInfo& info)
 	}
 
 	archName_ = info[0].As<Napi::String>().Utf8Value();
+
+	// Remill knows additional architecture names that are not backed by a
+	// semantics module in this package. Reject them before Arch::Get, whose
+	// SPARC64 initialization currently terminates the host process via CHECK.
+	if (!IsPackagedArch(archName_)) {
+		Napi::Error::New(env,
+			"Unsupported or unavailable architecture: " + archName_ +
+			". Use RemillLifter.getSupportedArchs() for packaged names.")
+			.ThrowAsJavaScriptException();
+		return;
+	}
 
 	// Determine OS name — default to linux semantics for lifting
 	std::string osName = "linux";
@@ -590,17 +617,9 @@ Napi::Value RemillLifter::GetSupportedArchs(const Napi::CallbackInfo& info) {
 	Napi::Env env = info.Env();
 	Napi::Array result = Napi::Array::New(env);
 
-	const char* archs[] = {
-		"x86", "x86_avx", "x86_avx512",
-		"amd64", "amd64_avx", "amd64_avx512",
-		"aarch64",
-		"sparc32", "sparc64",
-		nullptr
-	};
-
 	uint32_t idx = 0;
-	for (const char** p = archs; *p; ++p) {
-		result.Set(idx++, Napi::String::New(env, *p));
+	for (const char* arch : kPackagedArchs) {
+		result.Set(idx++, Napi::String::New(env, arch));
 	}
 
 	return result;
@@ -651,6 +670,14 @@ LiftResult RemillLifter::DoLift(
 		return result;
 	}
 
+	// FIX-101 (issue #37 Bug 5): the cloned semantics module inherits amd64.bc's
+	// ModuleID, which is the absolute load path of the bitcode on the BUILD host
+	// (e.g. "\\?\c:\Users\<builder>\...\amd64.bc"). Printing the lifted IR then
+	// leaks that host path in the `; ModuleID = '...'` header line. Reset both the
+	// module identifier and the source filename to a stable, host-independent name.
+	liftModule->setModuleIdentifier("hexcore-remill-lift");
+	liftModule->setSourceFileName("hexcore-remill-lift");
+
 	auto intrinsics = std::make_unique<remill::IntrinsicTable>(liftModule.get());
 	auto lifter = arch_->DefaultLifter(*intrinsics);
 	auto instLifter = std::static_pointer_cast<remill::InstructionLifterIntf>(lifter);
@@ -673,6 +700,7 @@ LiftResult RemillLifter::DoLift(
 		remill::Instruction inst;
 		uint64_t pc;
 		size_t size;
+		bool terminatesControlFlow = false;
 	};
 	std::vector<DecodedInst> decoded;
 	std::set<uint64_t> leaders;
@@ -870,6 +898,21 @@ LiftResult RemillLifter::DoLift(
 						di.inst.branch_taken_pc = 0;
 						di.inst.branch_not_taken_pc = 0;
 						decoded.push_back(di);
+
+						// FIX-120: Remill does not decode x86 UD2 in this build, so
+						// FIX-024 recovers its length and represents it as a NoOp. UD2 is
+						// nevertheless a CFG terminator. Keep the following bytes in a
+						// separate (normally unreachable) block; otherwise a following
+						// compiler-emitted JMP is appended to the trap block and replaces
+						// its terminal behavior. This is deliberately narrower than
+						// re-injecting every Pathfinder leader.
+						const bool isX86Ud2 = (isAMD64 || isX86) &&
+							insnLen == 2 && p[0] == 0x0F && p[1] == 0x0B;
+						decoded.back().terminatesControlFlow = isX86Ud2;
+						if (isX86Ud2 && scanOffset + insnLen < length) {
+							leaders.insert(scanPC + insnLen);
+						}
+
 						scanOffset += insnLen;
 						scanPC += insnLen;
 						fix024_xedRecovered++;
@@ -897,10 +940,19 @@ LiftResult RemillLifter::DoLift(
 			di.inst = scanInst;
 			di.pc = scanPC;
 			di.size = scanInst.bytes.size();
+			// Some Remill x86 configurations decode UD2 successfully but expose
+			// it as a non-terminating category. Recognize the architectural
+			// encoding independently of the decoder category as well.
+			di.terminatesControlFlow = di.size == 2 &&
+				static_cast<uint8_t>(scanInst.bytes[0]) == 0x0F &&
+				static_cast<uint8_t>(scanInst.bytes[1]) == 0x0B;
 			decoded.push_back(di);
 
 			uint64_t nextPC = scanPC + scanInst.bytes.size();
 			uint64_t endAddr = address + length;
+			if (di.terminatesControlFlow && nextPC < endAddr) {
+				leaders.insert(nextPC);
+			}
 
 			// Check if this instruction is a branch or call
 			// Remill categorizes instructions — check for jumps
@@ -1169,9 +1221,37 @@ LiftResult RemillLifter::DoLift(
 			continue;
 		}
 
+		// FIX-120: XED-recovered UD2 has no Remill semantic, but it must
+		// terminate this path. Finalize it before the generic NoOp handling can
+		// manufacture a fallthrough edge to the following dead-code block.
+		if (di.terminatesControlFlow) {
+			llvm::IRBuilder<> builder(currentBlock);
+			builder.CreateRet(func->getArg(2));
+			totalOffset += di.size;
+			continue;
+		}
+
 		// Lift the instruction into its block
 		auto status = instLifter->LiftIntoBlock(di.inst, currentBlock, false);
 		if (status != remill::kLiftedInstruction) {
+			// FIX-105: keep lifting PAST an instruction Remill cannot fully model,
+			// instead of `break`-ing and discarding every instruction after it -- the
+			// bug that collapsed branch-heavy AArch64 functions to ~26%, leaving the
+			// tail stubbed as common.ret. Two cases fall through to the next insn:
+			//   (a) kLiftedUnsupportedInstruction -- Remill RECOGNISED the encoding
+			//       but ships no semantic for it (e.g. AArch64 SIMD STP Qt,Qt2,[Xn],
+			//       or exotic x86 AVX-512/APX). LiftIntoBlock ALREADY emitted a
+			//       HandleUnsupported call modelling the side effect into this block,
+			//       so the block stays well-formed and we just advance the counter.
+			//   (b) a kCategoryNoOp decode-failure stub from FIX-024 (bytes Remill
+			//       could not decode at all) -- no liftable body, so skip it.
+			// A genuine hard error (invalid instruction / internal lifter error) on a
+			// real instruction still aborts exactly as before.
+			if (status == remill::kLiftedUnsupportedInstruction ||
+				di.inst.category == remill::Instruction::kCategoryNoOp) {
+				totalOffset += di.size;
+				continue;
+			}
 			if (totalOffset == 0) {
 				result.error = "Failed to lift instruction at 0x" +
 					std::to_string(di.pc);
@@ -2225,8 +2305,19 @@ LiftResult RemillLifter::DoLift(
 
 		size_t resolvedCount = 0;
 
+		// FIX-054: an externalSymbols_ address that falls inside our OWN lifted
+		// window [address, address+length) is a SELF-reference (a callfuscated
+		// function that takes its own address), never a real external callee.
+		// Declaring it emits `declare @<self>(...)` that collides with the lifted
+		// `define` once the TS lifted_<addr>->symbol rename runs => invalid LLVM
+		// redefinition => Helix stage-1 parse abort => 8-line stub. The define is
+		// still named lifted_<addr> here, so a by-name guard would miss it; gate on
+		// the ADDRESS instead. Skip self-references in every strategy below.
+		auto isSelfRef = [&](uint64_t a) { return a >= address && a < address + length; };
+
 		// Strategy 1: Scan callTargets from Phase 3 and inject declares
 		for (uint64_t ct : result.callTargets) {
+			if (isSelfRef(ct)) continue;
 			auto it = externalSymbols_.find(ct);
 			if (it != externalSymbols_.end()) {
 				getOrCreateExtern(it->second);
@@ -2253,6 +2344,7 @@ LiftResult RemillLifter::DoLift(
 					if (!targetArg) continue;
 
 					uint64_t targetAddr = targetArg->getZExtValue();
+					if (isSelfRef(targetAddr)) continue;  // FIX-054: self-reference
 					auto symIt = externalSymbols_.find(targetAddr);
 					if (symIt == externalSymbols_.end()) continue;
 
@@ -2272,6 +2364,7 @@ LiftResult RemillLifter::DoLift(
 		// symbols so the IR has `declare ptr @mutex_lock(...)` etc.
 		// The Helix decompiler uses these + @__hxreloc__ to resolve calls.
 		for (auto& [addr, name] : externalSymbols_) {
+			if (isSelfRef(addr)) continue;  // FIX-054: self-reference, owned by the define
 			getOrCreateExtern(name);
 		}
 	}
