@@ -15,6 +15,6 @@ python _rebuild_mt.py
 
 Or download the deps zip from the latest release:
 ```powershell
-gh release download v0.5.1 -p "remill-deps-win32-x64.zip" -R AkashaCorporation/hexcore-remill
+gh release download v0.5.2 -p "remill-deps-win32-x64.zip" -R AkashaCorporation/hexcore-remill
 Expand-Archive remill-deps-win32-x64.zip -DestinationPath .
 ```
